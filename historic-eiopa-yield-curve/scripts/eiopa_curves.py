@@ -54,6 +54,7 @@ import os
 import re
 import struct
 import sys
+import unicodedata
 from pathlib import Path
 
 PACK_MAGIC = b"EIOPACRV"
@@ -186,6 +187,10 @@ EXTRA_ALIASES = {
 
 
 def _norm_key(s: str) -> str:
+    # Fold accents first (Türkiye -> turkiye, España -> espana), otherwise the
+    # filter below deletes the accented letter and the alias never matches.
+    s = "".join(ch for ch in unicodedata.normalize("NFKD", s)
+                if not unicodedata.combining(ch))
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
@@ -614,6 +619,19 @@ def resolve_date(cv: Curves, raw: str):
 
 
 def _nearest(dates, target, raw):
+    # Snapping is only honest inside the snapshot. A month before the first
+    # release or after the last one has no answer here, and silently returning
+    # the edge release would present data from years away as the month asked
+    # for - or, past the end, hide that EIOPA has published since.
+    if target[:7] < dates[0][:7]:
+        raise SystemExit(
+            f"{raw} is before the first EIOPA release in this snapshot "
+            f"({dates[0]}). There is no RFR curve for that month.")
+    if target[:7] > dates[-1][:7]:
+        raise SystemExit(
+            f"{raw} is after the last release in this snapshot ({dates[-1]}). "
+            f"EIOPA may have published it since, but this data cannot know. "
+            f"Use 'latest' to get {dates[-1]} explicitly.")
     best = min(dates, key=lambda d: abs(_ord(d) - _ord(target)))
     return best, f"{raw} is not a published month-end; using nearest release {best}"
 
@@ -636,6 +654,11 @@ def _edge(cv: Curves, raw: str, lower: bool) -> str:
         y, m = re.split(r"[-/]", s)
         return (f"{int(y):04d}-{int(m):02d}-01" if lower
                 else f"{int(y):04d}-{int(m):02d}-31")
+    # A range bound past either end just means "everything on that side", so it
+    # is used as given rather than refused the way a single reference date is.
+    if (re.fullmatch(r"\d{4}-\d{2}-\d{2}", s)
+            and not cv.releases[0][:7] <= s[:7] <= cv.releases[-1][:7]):
+        return s
     return resolve_date(cv, s)[0]
 
 
@@ -728,7 +751,7 @@ def no_data(cv: Curves, code: str, date: str, ctype: str) -> str:
 def interpolation_note(any_interpolated: bool) -> str:
     if not any_interpolated:
         return ""
-    return ("\n\n_Rows marked † are interpolated, not published: EIOPA publishes "
+    return ("\n\n_Figures marked † are interpolated, not published: EIOPA publishes "
             "whole years only. Interpolation is log-linear on discount factors "
             "(constant forward between the neighbouring published nodes). Quote "
             "these as derived figures. Exact Smith-Wilson reconstruction of the "
@@ -950,17 +973,26 @@ def cmd_compare(cv, args):
                 codes.append(r)
     date, note = resolve_date(cv, args.date)
     k, ctype = ctype_id(args), ctype_name(args)
-    term = int(args.term)
+    terms = parse_terms(args.term)
+    if len(terms) > 1:
+        raise SystemExit("compare takes one term at a time; give a single --term.")
+    term = terms[0]
     base = resolve_country(args.vs) if args.vs else None
 
-    vals = {c: cv.rate(c, date, k, term) for c in codes}
+    vals, interp = {}, False
+    for c in codes:
+        vals[c], is_interp = cv.rate_at(c, date, k, term)
+        interp = interp or (is_interp and vals[c] is not None)
     if all(v is None for v in vals.values()):
         raise SystemExit(no_data(cv, codes[0], date, ctype))
     if base and vals.get(base) is None:
         raise SystemExit(f"No {term}y {ctype} rate for the base curve "
                          f"{label(base)} at {date}.")
 
-    headers = ["Country", f"{term}y spot"] + ([f"vs {base}"] if base else [])
+    # Every row shares the one term, so the interpolation marker goes on the
+    # column rather than on each row.
+    headers = (["Country", f"{fmt_term(term)} spot" + (" †" if interp else "")]
+               + ([f"vs {base}"] if base else []))
     rows = []
     for c in sorted(vals, key=lambda c: (vals[c] is None, -(vals[c] or 0))):
         row = [label(c), pct(vals[c])]
@@ -974,9 +1006,9 @@ def cmd_compare(cv, args):
     missing = [c for c in codes if vals[c] is None]
     foot = ("\n\n_No curve published at this date for: "
             + ", ".join(label(c) for c in missing) + "._") if missing else ""
-    foot += identical_note(cv, vals, ctype)
+    foot += identical_note(cv, vals, ctype) + interpolation_note(interp)
     emit(args, {"reference_date": date, "curve_type": ctype, "term": term,
-                "base": base, "rates": vals,
+                "interpolated": interp, "base": base, "rates": vals,
                 "identical_groups": identical_groups(vals)},
          head + "\n\n" + table(headers, rows) + foot)
 
@@ -999,7 +1031,14 @@ def cmd_forward(cv, args):
     if not curve:
         raise SystemExit(no_data(cv, code, date, ctype))
 
-    tenor = parse_terms(args.tenor)[0]
+    tenors = parse_terms(args.tenor)
+    if len(tenors) > 1:
+        raise SystemExit("forward takes one --tenor at a time; list several "
+                         "start points with --start instead.")
+    tenor = tenors[0]
+    if tenor <= 0:
+        raise SystemExit(f"--tenor must be a positive number of years, not "
+                         f"{args.tenor}. A forward covers a period after it starts.")
     rows, payload, interp = [], [], False
     for t1 in parse_terms(args.start):
         t2 = t1 + tenor

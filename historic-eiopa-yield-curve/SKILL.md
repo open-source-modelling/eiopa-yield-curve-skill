@@ -67,7 +67,10 @@ asked about.
 Dates are forgiving: `2024-12-31`, `2024-12`, `Dec 2024`, `2024Q4`, `2024`
 (year-end), `latest`. Anything that is not a published month-end snaps to the
 nearest release and the output says so — repeat that in your answer rather than
-silently reporting a different month than the one asked about.
+silently reporting a different month than the one asked about. A month before
+the first release or after the last one is refused rather than snapped: say the
+snapshot does not cover it, and use `latest` only if the person wants the newest
+month this data has.
 
 Countries are forgiving too: country code, currency code, or full name
 (`Germany`, `DE`, `Deutschland`; `UK`, `GB`, `Britain`; `EU`, `eurozone`).

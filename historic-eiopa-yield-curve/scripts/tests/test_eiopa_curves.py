@@ -1096,6 +1096,76 @@ class TestCliSurface(unittest.TestCase):
         self.assertIn("labels curves by currency", r.stdout)
 
 
+class TestReviewRegressions(unittest.TestCase):
+    """Four defects found while widening the suite. Each crashed, refused a
+    documented input, or answered about the wrong month."""
+
+    def test_compare_accepts_a_fractional_term_and_flags_it(self):
+        r = run_cli("compare", "--countries", "DE,UK", "--term", "7.5",
+                    "--date", "2024-12-31", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        p = json.loads(r.stdout)
+        self.assertTrue(p["interpolated"])
+        self.assertAlmostEqual(p["rates"]["DE"],
+                               CV.rate_at("DE", "2024-12-31", 0, 7.5)[0], places=12)
+        text = run_cli("compare", "--countries", "DE,UK", "--term", "7.5",
+                       "--date", "2024-12-31").stdout
+        self.assertIn("interpolated, not published", text)
+
+    def test_compare_whole_term_is_not_flagged(self):
+        p = json.loads(run_cli("compare", "--countries", "DE,UK", "--term", "10",
+                               "--date", "2024-12-31", "--json").stdout)
+        self.assertFalse(p["interpolated"])
+
+    def test_compare_bad_term_fails_cleanly(self):
+        for bad in ("abc", "5,10"):
+            with self.subTest(term=bad):
+                r = run_cli("compare", "--countries", "DE,UK", "--term", bad,
+                            "--date", "2024-12-31")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertNotIn("Traceback", r.stderr)
+
+    def test_forward_rejects_a_non_positive_tenor(self):
+        for bad in ("0", "-5"):
+            with self.subTest(tenor=bad):
+                r = run_cli("forward", "--country", "DE", "--start", "5",
+                            "--tenor", bad, "--date", "2024-12-31")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertIn("positive", r.stdout + r.stderr)
+
+    def test_accented_country_names_resolve(self):
+        for raw, want in (("Türkiye", "TR"), ("España", "ES"),
+                          ("Österreich", "AT"), ("Côte", None)):
+            with self.subTest(raw=ascii(raw)):
+                if want is None:
+                    with self.assertRaises(SystemExit):
+                        ec.resolve_country(raw)
+                else:
+                    self.assertEqual(ec.resolve_country(raw), want)
+
+    def test_dates_outside_the_snapshot_are_refused_not_snapped(self):
+        first, last = CV.releases[0], CV.releases[-1]
+        for raw in ("1999-12-31", "2014-11-30", "2014-11", "2099-12-31",
+                    "2099-01"):
+            with self.subTest(raw=raw), self.assertRaises(SystemExit) as cm:
+                ec.resolve_date(CV, raw)
+            msg = str(cm.exception)
+            self.assertTrue(first in msg or last in msg, msg)
+
+    def test_dates_inside_the_snapshot_still_snap(self):
+        self.assertEqual(ec.resolve_date(CV, "2014-12-01")[0], "2014-12-31")
+        self.assertEqual(ec.resolve_date(CV, CV.releases[-1][:8] + "01")[0],
+                         CV.releases[-1])
+
+    def test_open_ended_series_bounds_are_still_allowed(self):
+        p = json.loads(run_cli("series", "--country", "DE", "--term", "10",
+                               "--from", "2000-01-01", "--to", "2099-12-31",
+                               "--json").stdout)
+        self.assertEqual(p["range"]["first"], CV.releases[0])
+        self.assertEqual(p["range"]["last"], CV.releases[-1])
+
+
 # A tiny, hand-written source dataset: two releases either side of the
 # currency-to-country label switch, both curve types, a negative rate, and the
 # float-formatted term_index the real CSV uses.
