@@ -1,5 +1,7 @@
 # Historic EIOPA Yield Curve Skill
 
+[![Tests](https://github.com/open-source-modelling/eiopa-yield-curve-skill/actions/workflows/tests.yml/badge.svg)](https://github.com/open-source-modelling/eiopa-yield-curve-skill/actions/workflows/tests.yml)
+
 A self-contained [Claude Skill](https://www.anthropic.com/news/skills) for answering questions about historic EIOPA risk-free rate (RFR) yield curves — spot rates, full term structures, tenors over time, country comparisons, implied forwards, Solvency II stressed curves, and curve parameters (UFR, LLP, alpha, CRA, VA).
 
 No network access, database, or third-party packages required. Every monthly EIOPA release is bundled directly into this repo as a compact binary pack (~370 KB), so lookups run offline in well under a second.
@@ -74,6 +76,8 @@ python scripts/tests/test_eiopa_curves.py
 ```
 
 Pure stdlib `unittest`, no `pytest`, no network. Pins known rates and verifies every structural claim in `SKILL.md` against the bundled data.
+
+The same suite runs on every push and pull request via GitHub Actions ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)) on Python 3.10–3.14 (Linux) plus Windows and macOS. Tests that need an `EIOPA_all_curves` checkout (`EIOPA_REPO`) or `openpyxl` skip themselves in CI.
 
 ## License / data source
 

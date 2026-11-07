@@ -1,0 +1,46 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # The skill runs on users' own machines, so check the other two
+          # platforms too (paths, line endings, console encoding).
+          - os: windows-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.13"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Stdlib only, no install step: the suite itself checks that the tool
+      # needs nothing beyond Python. Tests that need an EIOPA_all_curves
+      # checkout or openpyxl skip themselves.
+      - name: Run unit tests
+        working-directory: historic-eiopa-yield-curve
+        run: python scripts/tests/test_eiopa_curves.py
