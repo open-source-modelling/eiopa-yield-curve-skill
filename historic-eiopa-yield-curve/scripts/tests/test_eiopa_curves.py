@@ -34,8 +34,10 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import lzma
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -70,7 +72,7 @@ def run_cli(*args, cwd=None, tool=None) -> subprocess.CompletedProcess:
 
 
 def golden() -> dict:
-    return json.loads(GOLDEN.read_text())
+    return json.loads(GOLDEN.read_text(encoding="utf-8"))
 
 
 def repo_data_dir():
@@ -158,7 +160,7 @@ class TestStandalone(unittest.TestCase):
             self.assertIn("curves.pack", r.stdout + r.stderr)
 
     def test_uses_only_the_standard_library(self):
-        src = TOOL.read_text()
+        src = TOOL.read_text(encoding="utf-8")
         for banned in ("import pandas", "import numpy", "import openpyxl",
                        "import requests", "import pyarrow"):
             self.assertNotIn(banned, src,
@@ -820,6 +822,387 @@ class TestSpotCheckSuite(unittest.TestCase):
         self.assertAlmostEqual(payload["percent"], 2.267, places=6)
         self.assertAlmostEqual(payload["spot_rate"] * 100, payload["percent"],
                                places=6)
+
+
+class TestDateResolution(unittest.TestCase):
+    """resolve_date is the front door for every command. SKILL.md and the error
+    message both promise these spellings work, so each one is exercised."""
+
+    def test_exact_release_needs_no_note(self):
+        self.assertEqual(ec.resolve_date(CV, "2024-12-31"), ("2024-12-31", None))
+
+    def test_month_spellings(self):
+        for raw in ("2024-12", "2024/12", "Dec 2024", "December 2024",
+                    "2024 december", "  dec 2024  "):
+            with self.subTest(raw=raw):
+                self.assertEqual(ec.resolve_date(CV, raw)[0], "2024-12-31")
+        self.assertEqual(ec.resolve_date(CV, "2024/6")[0], "2024-06-30")
+
+    def test_quarter_spellings_snap_to_quarter_end(self):
+        for raw in ("2024Q2", "2024 q2", "Q2 2024"):
+            with self.subTest(raw=raw):
+                date, note = ec.resolve_date(CV, raw)
+                self.assertEqual(date, "2024-06-30")
+                self.assertIn("quarter-end", note)
+
+    def test_bare_year_is_year_end_and_says_so(self):
+        date, note = ec.resolve_date(CV, "2020")
+        self.assertEqual(date, "2020-12-31")
+        self.assertIn("year-end", note)
+
+    def test_relative_keywords(self):
+        for raw in ("latest", "LAST", "most recent"):
+            self.assertEqual(ec.resolve_date(CV, raw)[0], CV.releases[-1])
+        for raw in ("earliest", "first", "oldest"):
+            self.assertEqual(ec.resolve_date(CV, raw)[0], CV.releases[0])
+
+    def test_unreadable_date_fails_loudly(self):
+        with self.assertRaises(SystemExit) as cm:
+            ec.resolve_date(CV, "next tuesday")
+        self.assertIn("Could not read", str(cm.exception))
+
+    def test_range_edges_cover_whole_periods(self):
+        self.assertEqual(ec.resolve_range(CV, "2020", "2020"),
+                         ("2020-01-01", "2020-12-31"))
+        self.assertEqual(ec.resolve_range(CV, "2020-06", "2020-06"),
+                         ("2020-06-01", "2020-06-31"))
+        self.assertEqual(ec.resolve_range(CV, None, None),
+                         (CV.releases[0], CV.releases[-1]))
+
+
+class TestCountryResolution(unittest.TestCase):
+    """A misspelt country must fail, and every documented spelling must not."""
+
+    def test_every_code_and_name_resolves_to_itself(self):
+        for code, name in ec.COUNTRY_NAMES.items():
+            with self.subTest(code=code):
+                self.assertEqual(ec.resolve_country(code), code)
+                self.assertEqual(ec.resolve_country(code.lower()), code)
+                self.assertEqual(ec.resolve_country(name), code)
+                self.assertEqual(ec.resolve_country(name.upper()), code)
+
+    def test_every_currency_code_resolves_to_its_country(self):
+        for cur, code in ec.CURRENCY_TO_COUNTRY.items():
+            with self.subTest(currency=cur):
+                self.assertEqual(ec.resolve_country(cur), code)
+
+    def test_every_extra_alias_points_at_a_known_code(self):
+        for alias, code in ec.EXTRA_ALIASES.items():
+            with self.subTest(alias=alias):
+                self.assertIn(code, ec.COUNTRY_NAMES)
+                self.assertEqual(ec.resolve_country(alias), code)
+
+    def test_punctuation_and_case_are_ignored(self):
+        for raw, want in (("united-kingdom", "UK"), ("Euro Area", "EU"),
+                          ("U.S.A.", "US"), ("czech republic", "CZ")):
+            self.assertEqual(ec.resolve_country(raw), want)
+
+    def test_unknown_country_lists_near_misses(self):
+        with self.assertRaises(SystemExit) as cm:
+            ec.resolve_country("Germ")
+        self.assertIn("Closest matches", str(cm.exception))
+        self.assertIn("DE", str(cm.exception))
+
+    def test_every_curve_in_the_pack_has_a_display_name(self):
+        missing = [c for c in CV.countries if c not in ec.COUNTRY_NAMES]
+        self.assertEqual(missing, [], "label() would print a bare code for these")
+
+    def test_every_raw_label_canonicalises_to_its_code(self):
+        for code in CV.countries:
+            for _lo, _hi, raw in CV.labels(code):
+                with self.subTest(code=code, raw=raw):
+                    self.assertEqual(ec.canonical_country(raw), code)
+
+
+class TestFormattingHelpers(unittest.TestCase):
+
+    def test_parse_terms(self):
+        got = ec.parse_terms(" 1, 5,10.5 ,")
+        self.assertEqual(got, [1, 5, 10.5])
+        self.assertIsInstance(got[0], int, "whole terms must stay ints so they "
+                                           "print as 10y, not 10.0y")
+        self.assertEqual(ec.parse_terms("10.0"), [10])
+        self.assertIsInstance(ec.parse_terms("10.0")[0], int)
+
+    def test_parse_terms_rejects_junk(self):
+        for bad in ("x", "1,two", ",", ""):
+            with self.subTest(spec=bad), self.assertRaises(SystemExit):
+                ec.parse_terms(bad)
+
+    def test_fmt_pct_bps(self):
+        self.assertEqual(ec.fmt_term(10), "10y")
+        self.assertEqual(ec.fmt_term(7.5), "7.5y")
+        self.assertEqual(ec.pct(0.02267), "2.267%")
+        self.assertEqual(ec.pct(None), "n/a")
+        self.assertEqual(ec.bps(0.01805), "+180.5 bp")
+        self.assertEqual(ec.bps(-0.0001), "-1.0 bp")
+        self.assertEqual(ec.bps(None), "n/a")
+
+    def test_table(self):
+        self.assertEqual(ec.table(["a"], []), "_no rows_")
+        t = ec.table(["Term", "Rate"], [["1y", "2.000%"], ["10y", "3.000%"]])
+        lines = t.splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(len({len(l) for l in lines}), 1, "columns must align")
+
+
+class TestCurveCommand(unittest.TestCase):
+    """`curve` had no CLI coverage at all."""
+
+    def _json(self, *extra):
+        r = run_cli("curve", "--country", "DE", "--date", "2024-12-31",
+                    "--json", *extra)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_default_shows_the_key_tenors_with_published_values(self):
+        p = self._json()
+        self.assertEqual(list(p["curve"]), ["1", "2", "3", "5", "7", "10", "15",
+                                            "20", "25", "30", "40", "50"])
+        full = CV.curve("DE", "2024-12-31", 0)
+        for t, v in p["curve"].items():
+            self.assertEqual(v, full[int(t)])
+
+    def test_full_returns_every_published_term(self):
+        p = self._json("--full")
+        self.assertEqual(len(p["curve"]), CV.max_term("DE", 0, "2024-12-31"))
+
+    def test_va_switches_curve_type(self):
+        p = self._json("--va", "--terms", "10")
+        self.assertEqual(p["curve_type"], "with_VA")
+        self.assertEqual(p["curve"]["10"], CV.rate("DE", "2024-12-31", 1, 10))
+
+    def test_text_marks_interpolation_and_shows_discount_factors(self):
+        r = run_cli("curve", "--country", "DE", "--date", "2024-12-31",
+                    "--terms", "7.5,10", "--df")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Discount factor", r.stdout)
+        self.assertIn("†", r.stdout)
+        self.assertIn(f"{ec.discount_factor(0.02267, 10):.6f}", r.stdout)
+
+    def test_unpublished_curve_fails_and_lists_what_exists(self):
+        r = run_cli("curve", "--country", "BR", "--date", "2025-06-30")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("No curve for Brazil", r.stdout + r.stderr)
+
+
+class TestCompareCommand(unittest.TestCase):
+
+    def test_spreads_vs_a_base_curve(self):
+        r = run_cli("compare", "--countries", "DE,UK,US", "--term", "10",
+                    "--date", "2024-12-31", "--vs", "DE")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        de = CV.rate("DE", "2024-12-31", 0, 10)
+        uk = CV.rate("UK", "2024-12-31", 0, 10)
+        self.assertIn(ec.bps(uk - de), r.stdout)
+
+    def test_duplicate_spellings_collapse_to_one_row(self):
+        p = json.loads(run_cli("compare", "--countries", "DE,Germany,de",
+                               "--term", "10", "--date", "2024-12-31",
+                               "--json").stdout)
+        self.assertEqual(list(p["rates"]), ["DE"])
+
+    def test_missing_country_is_footnoted_not_dropped(self):
+        r = run_cli("compare", "--countries", "DE,BR", "--term", "10",
+                    "--date", "2025-06-30")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("No curve published at this date for: Brazil", r.stdout)
+
+    def test_missing_base_curve_fails(self):
+        r = run_cli("compare", "--countries", "DE,UK", "--term", "10",
+                    "--date", "2025-06-30", "--vs", "BR")
+        self.assertNotEqual(r.returncode, 0)
+
+
+class TestSeriesCommand(unittest.TestCase):
+
+    def test_quarterly_sampling_shows_only_quarter_ends(self):
+        p = json.loads(run_cli("series", "--country", "DE", "--term", "10",
+                               "--from", "2023", "--to", "2023",
+                               "--freq", "quarter", "--json").stdout)
+        months = [s["reference_date"][5:7] for s in p["series"]]
+        self.assertEqual(months, ["03", "06", "09", "12"])
+        self.assertEqual(p["range"]["published_months"], 12)
+
+    def test_month_upper_bound_includes_that_month(self):
+        p = json.loads(run_cli("series", "--country", "DE", "--term", "10",
+                               "--from", "2020-01", "--to", "2020-06",
+                               "--json").stdout)
+        self.assertEqual(p["range"]["first"], "2020-01-31")
+        self.assertEqual(p["range"]["last"], "2020-06-30")
+        self.assertEqual(len(p["series"]), 6)
+
+    def test_series_rejects_several_terms(self):
+        r = run_cli("series", "--country", "DE", "--term", "1,2")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("one term", r.stdout + r.stderr)
+
+    def test_empty_range_fails_with_a_pointer_to_coverage(self):
+        r = run_cli("series", "--country", "DE", "--term", "10",
+                    "--from", "2025", "--to", "2020")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("coverage --country DE", r.stdout + r.stderr)
+
+
+class TestForwardAndParams(unittest.TestCase):
+
+    def test_forward_from_zero_is_the_spot_rate(self):
+        p = json.loads(run_cli("forward", "--country", "DE", "--start", "0",
+                               "--tenor", "10", "--date", "2024-12-31",
+                               "--json").stdout)
+        self.assertAlmostEqual(p["forwards"][0]["forward_rate"],
+                               CV.rate("DE", "2024-12-31", 0, 10), places=12)
+
+    def test_forward_past_the_curve_is_null_not_extrapolated(self):
+        p = json.loads(run_cli("forward", "--country", "DE", "--start", "1,140",
+                               "--tenor", "20", "--date", "2024-12-31",
+                               "--json").stdout)
+        self.assertEqual(len(p["forwards"]), 2)
+        self.assertIsNotNone(p["forwards"][0]["forward_rate"])
+        self.assertIsNone(p["forwards"][1]["forward_rate"])
+
+    def test_params_with_va_carries_the_volatility_adjustment(self):
+        p = json.loads(run_cli("params", "--country", "DE", "--date",
+                               "2024-12-31", "--va", "--json").stdout)
+        self.assertEqual(p["curve_type"], "with_VA")
+        self.assertEqual(float(p["va"]), 23.0)
+        self.assertEqual(float(p["llp"]), 20.0)
+
+    def test_params_for_an_unpublished_curve_fails(self):
+        r = run_cli("params", "--country", "BR", "--date", "2025-06-30")
+        self.assertNotEqual(r.returncode, 0)
+
+
+class TestCliSurface(unittest.TestCase):
+
+    def test_help_works_for_every_subcommand(self):
+        for sub in ("", "spot", "curve", "series", "compare", "forward", "shock",
+                    "params", "facts", "coverage", "pack"):
+            with self.subTest(sub=sub or "<top>"):
+                r = run_cli(*([sub] if sub else []), "--help")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("usage", r.stdout.lower())
+
+    def test_missing_subcommand_is_a_usage_error(self):
+        self.assertEqual(run_cli().returncode, 2)
+
+    def test_coverage_for_one_release_lists_its_curves(self):
+        p = json.loads(run_cli("coverage", "--date", "2025-06-30", "--json").stdout)
+        self.assertEqual(p["countries"], CV.countries_at("2025-06-30"))
+        self.assertNotIn("BR", p["countries"])
+
+    def test_currency_era_release_says_labels_were_normalised(self):
+        r = run_cli("coverage", "--date", "2014-12-31")
+        self.assertIn("labels curves by currency", r.stdout)
+
+
+# A tiny, hand-written source dataset: two releases either side of the
+# currency-to-country label switch, both curve types, a negative rate, and the
+# float-formatted term_index the real CSV uses.
+_FIXTURE_CSV = """reference_date,curve_type,country,term_index,spot_rate
+2015-01-31,no_VA,CHF,1.0,-0.00512
+2015-01-31,no_VA,CHF,2.0,-0.00400
+2015-01-31,no_VA,CHF,3.0,0.00123
+2015-01-31,with_VA,CHF,1.0,-0.00500
+2015-01-31,with_VA,CHF,2.0,-0.00390
+2015-01-31,with_VA,CHF,3.0,0.00133
+2016-01-31,no_VA,CH,1.0,0.01000
+2016-01-31,no_VA,CH,2.0,0.01100
+2016-01-31,no_VA,CH,3.0,0.01250
+2016-01-31,with_VA,CH,1.0,0.01010
+2016-01-31,with_VA,CH,2.0,0.01110
+2016-01-31,with_VA,CH,3.0,0.01260
+"""
+_FIXTURE_PARAMS = """reference_date,curve_type,country,llp,ufr,va
+2015-01-31,no_VA,CHF,25.0,4.2,0.0
+2016-01-31,with_VA,CH,25.0,3.65,1.0
+"""
+
+
+class TestPackFormatSynthetic(unittest.TestCase):
+    """The pack writer and reader, tested without an EIOPA checkout. The
+    existing round-trip tests skip in CI because they need the real CSVs; this
+    builds a pack from a fixture so the format is always exercised."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._td.name)
+        (cls.tmp / "data").mkdir()
+        (cls.tmp / "data" / "yield_curves.csv").write_text(_FIXTURE_CSV,
+                                                            encoding="utf-8")
+        (cls.tmp / "data" / "curve_parameters.csv").write_text(_FIXTURE_PARAMS,
+                                                                encoding="utf-8")
+        cls.pack = ec.write_pack(cls.tmp / "data", cls.tmp / "out" / "t.pack",
+                                 quiet=True)
+        cls.cv = ec.load(cls.pack)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def test_structure(self):
+        self.assertEqual(self.cv.releases, ["2015-01-31", "2016-01-31"])
+        self.assertEqual(self.cv.countries, ["CH"])
+        self.assertEqual(self.cv.n_observations, 12)
+
+    def test_every_rate_round_trips_exactly(self):
+        import csv as _csv
+        for r in _csv.DictReader(_FIXTURE_CSV.splitlines()):
+            with self.subTest(**r):
+                got = self.cv.rate(ec.canonical_country(r["country"]),
+                                   r["reference_date"],
+                                   ec.CURVE_TYPES.index(r["curve_type"]),
+                                   int(float(r["term_index"])))
+                self.assertEqual(got, float(r["spot_rate"]))
+
+    def test_labels_and_currency_era(self):
+        self.assertEqual(self.cv.labels("CH"),
+                         [("2015-01-31", "2015-01-31", "CHF"),
+                          ("2016-01-31", "2016-01-31", "CH")])
+        self.assertEqual(self.cv.raw_label("CH", "2015-01-31"), "CHF")
+        self.assertEqual(self.cv.currency_era_end(), "2015-01-31")
+
+    def test_params_are_keyed_by_canonical_country(self):
+        self.assertEqual(self.cv.params("CH", "2015-01-31", "no_VA")["ufr"], "4.2")
+        self.assertEqual(self.cv.params("CH", "2016-01-31", "with_VA")["va"], "1.0")
+        self.assertIsNone(self.cv.params("CH", "2016-01-31", "no_VA"))
+
+    def test_cli_pack_flag_reads_the_given_pack(self):
+        p = json.loads(run_cli("spot", "--pack", str(self.pack), "--country",
+                               "Switzerland", "--term", "3", "--date",
+                               "2015-01-31", "--json").stdout)
+        self.assertEqual(p["rates"][0]["spot_rate"], 0.00123)
+        self.assertEqual(p["latest_release_in_snapshot"], "2016-01-31")
+
+    def test_cli_pack_subcommand_writes_to_out(self):
+        out = self.tmp / "cli.pack"
+        r = run_cli("pack", "--data-dir", str(self.tmp / "data"), "--out", str(out))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(ec.load(out).releases, self.cv.releases)
+
+    def test_pack_without_source_csv_fails(self):
+        r = run_cli("pack", "--data-dir", str(self.tmp / "nope"),
+                    "--out", str(self.tmp / "x.pack"))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("nothing to pack", r.stdout + r.stderr)
+        self.assertFalse((self.tmp / "x.pack").exists())
+
+    def test_foreign_file_is_rejected(self):
+        bad = self.tmp / "bad.pack"
+        bad.write_bytes(lzma.compress(b"NOTAPACK" + b"\0" * 32))
+        with self.assertRaises(SystemExit) as cm:
+            ec.read_pack(bad)
+        self.assertIn("not an EIOPA curve pack", str(cm.exception))
+
+    def test_future_pack_version_is_rejected(self):
+        hb = json.dumps({"version": ec.PACK_VERSION + 1}).encode()
+        bad = self.tmp / "v2.pack"
+        bad.write_bytes(lzma.compress(ec.PACK_MAGIC + struct.pack("<I", len(hb))
+                                      + hb))
+        with self.assertRaises(SystemExit) as cm:
+            ec.read_pack(bad)
+        self.assertIn("pack version", str(cm.exception))
 
 
 # --------------------------------------------------------------------------
